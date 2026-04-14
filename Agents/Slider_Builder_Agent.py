@@ -1,4 +1,4 @@
-# Agents/slide_builder_agent.py
+# Agents/Slider_Builder_Agent.py
 
 """
 Slide Beamer Code Generation Agent
@@ -66,7 +66,6 @@ class SlideBuilderAgent:
         return match.group(1) if match else None
 
     def academic_design_block(self):
-        # Inject a consistent academic theme even when the model returns plain Beamer.
         return r"""
 % Talexa academic visual design
 \usetheme{Madrid}
@@ -140,7 +139,6 @@ class SlideBuilderAgent:
         if "% Talexa academic visual design" in code:
             return code
 
-        # Add the visual theme inside the Beamer preamble without touching slide content.
         match = re.search(
             r'(\\documentclass(?:\[[^\]]*\])?\{beamer\})(.*?)(\\begin\{document\})',
             code,
@@ -164,8 +162,6 @@ class SlideBuilderAgent:
 
     def _chat_with_ollama(self, model_name, messages, request_label, options=None):
         try:
-            # Route all Ollama calls through one helper so timeout and connection errors
-            # are reported consistently across generation, correction, and VLM review.
             response = self.ollama_client.chat(
                 model=model_name,
                 messages=messages,
@@ -215,26 +211,11 @@ class SlideBuilderAgent:
             ],
         )
 
-    def find_all_tex_files(self, root_dir):
-        tex_files = []
-        for dirpath, dirnames, filenames in os.walk(root_dir):
-            for filename in filenames:
-                if filename.endswith(".tex"):
-                    full_path = os.path.join(dirpath, filename)
-                    try:
-                        with open(full_path, "r", encoding="utf-8") as f:
-                            tex_files.append(f.read())
-                    except Exception as e:
-                        print(f"⚠️ Skip {full_path}: {e}")
-                        continue
-        return tex_files
-
     def compile_tex(self, tex_path):
         tex_path = Path(tex_path).resolve()
         if not tex_path.exists():
             raise FileNotFoundError(f"Tex file {tex_path} does not exist")
 
-        # Prefer Tectonic when present, but fall back to common TeX engines available on Windows.
         candidates = [
             ("tectonic", ["tectonic", str(tex_path)]),
             ("pdflatex", ["pdflatex", "-interaction=nonstopmode", str(tex_path.name)]),
@@ -268,6 +249,7 @@ class SlideBuilderAgent:
             print(f"Compilation failed with {compiler_name}:")
             print(e.stderr)
             return e.stderr or e.stdout
+
     def correcte_error(self, beamer_code, error_info):
         with open(self.correct_prompt_path, "r", encoding="utf-8") as f:
             template_prompt = f.read()
@@ -316,12 +298,7 @@ class SlideBuilderAgent:
         pix.save(out_path.as_posix())
         return out_path
 
-    # -------------------- ADDED FUNCTION --------------------
     def render_pdf_pages(self, pdf_path, image_dir, dpi=200, fmt="png"):
-        """
-        Render all pages of a multi-page PDF into separate images.
-        Used for the final slide deck so the next agent can consume slide images.
-        """
         pdf_path = Path(pdf_path)
         image_dir = Path(image_dir)
 
@@ -348,7 +325,6 @@ class SlideBuilderAgent:
                 saved_paths.append(str(out_path))
 
         return saved_paths
-    # --------------------------------------------------------
 
     def add_small_after_blocks(self, tex) -> str:
         pattern = re.compile(
@@ -596,8 +572,6 @@ class SlideBuilderAgent:
         with open(self.select_proposal_prompt_path, "r", encoding="utf-8") as f:
             template_prompt = f.read()
 
-        # Only refine frames that actually triggered overfull warnings because those are the
-        # slides most likely to need layout intervention rather than content changes.
         warning_info = re.findall(r'^(warning: .+)', feedback, flags=re.MULTILINE)
         warning_info = warning_info[:len(warning_info)//2]
         warning_info = [s for s in warning_info if 'Overfull' in s]
@@ -630,7 +604,6 @@ class SlideBuilderAgent:
 
         need_improve_list = sorted(set(need_improve_list))
 
-        # changed only save path
         proposal_tmp_dir = path.join("Data", "intermediate", "proposal_imgs")
         os.makedirs(proposal_tmp_dir, exist_ok=True)
 
@@ -643,8 +616,6 @@ class SlideBuilderAgent:
             proposal_code_list = []
 
             for factor in factors:
-                # Generate several width-scaled variants of the same frame so the VLM can
-                # choose the most balanced visual layout without rewriting the content.
                 proposal_code = self.scale_includegraphics_widths(frame["text"], factor)
                 proposal_code = self.add_small_after_blocks(proposal_code)
                 proposal_full_code = "\n".join([
@@ -678,7 +649,7 @@ class SlideBuilderAgent:
 
             content = self.query_ollama_with_image(
                 model_name=self.vlm_model,
-                system_prompt="You are a slide layout selection assistant. Respond only in JSON like {\"choice\":\"A\"}.",
+                system_prompt='You are a slide layout selection assistant. Respond only in JSON like {"choice":"A"}.',
                 user_prompt="\n".join([template_prompt, "Here are the choices A, B, C, D"]),
                 image_path=prompt_img_path,
             )
@@ -688,7 +659,6 @@ class SlideBuilderAgent:
                 choice = json.loads(choice_str)
                 refined_code = proposal_code_list[map_dic[choice["choice"]]]
             except Exception:
-                # Fall back to the original scale if the selection model returns invalid JSON.
                 refined_code = proposal_code_list[0]
 
             frames[frame_idx]["text"] = refined_code
@@ -768,7 +738,6 @@ class SlideBuilderAgent:
         final_tex = final_pdf.with_suffix(".tex")
         output_dir = final_pdf.parent
 
-        # Keep only the final PDF/TEX pair while removing the draft, refined, and compiler byproducts.
         prefixes = {final_pdf.stem}
         if primary_tex_path is not None:
             primary_stem = Path(primary_tex_path).resolve().stem
@@ -800,10 +769,19 @@ class SlideBuilderAgent:
             if extra_path.exists():
                 shutil.rmtree(extra_path, ignore_errors=True)
 
-    def run(self, latex_input_path, beamer_save_path, beamer_temp_name=None, max_fix_attempts=10, improve=True):
+    def run(
+        self,
+        latex_input_path,
+        beamer_save_path,
+        beamer_temp_name=None,
+        max_fix_attempts=10,
+        improve=True,
+        intermediate_image_dir=None,
+    ):
         print("Starting SlideBuilderAgent...\n")
 
-        os.makedirs(os.path.dirname(beamer_save_path), exist_ok=True)
+        beamer_save_path = str(Path(beamer_save_path).resolve())
+        Path(beamer_save_path).parent.mkdir(parents=True, exist_ok=True)
 
         code = self.generate_beamer(
             latex_input_path=latex_input_path,
@@ -815,7 +793,6 @@ class SlideBuilderAgent:
             print("Slide generation failed.")
             return None
 
-        # Compile immediately so we can either iterate on LaTeX errors or continue to layout refinement.
         feedback = self.compile_tex(beamer_save_path)
 
         attempt = 0
@@ -844,9 +821,10 @@ class SlideBuilderAgent:
         else:
             final_pdf = beamer_save_path.replace(".tex", ".pdf")
 
-        # Export the final deck as slide images for downstream agents that work on per-slide visuals.
-        intermediate_dir = os.path.join("Data", "intermediate", Path(final_pdf).stem)
-        rendered_images = self.render_pdf_pages(final_pdf, intermediate_dir, dpi=200)
+        if intermediate_image_dir is None:
+            raise ValueError("intermediate_image_dir must be provided")
+
+        rendered_images = self.render_pdf_pages(final_pdf, intermediate_image_dir, dpi=200)
 
         print("\nRendered slide images:")
         for img in rendered_images:
@@ -870,25 +848,12 @@ if __name__ == "__main__":
     )
 
     final_pdf = agent.run(
-        latex_input_path="Data/output/lecture1.tex",   # output from LatexAgent
+        latex_input_path="Data/output/lecture1.tex",
         beamer_save_path="lecture1_slides.tex",
         beamer_temp_name=None,
         max_fix_attempts=10,
-        improve=True
+        improve=True,
+        intermediate_image_dir="Data/intermediate/lecture1_slides_refined",
     )
 
     print("\nGenerated file:", final_pdf)
-
-
-
-
-
-
-
-
-
-
-
-
-
-                                                                                                                                                                                                                       

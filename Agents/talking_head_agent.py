@@ -1,321 +1,651 @@
-import os
+import argparse
 import glob
+import hashlib
+import json
+import mimetypes
+import os
+import re
 import subprocess
+import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import httpx
+from PIL import Image, ImageOps
 
 
-class TalkingHeadAgent:
+class TalkingHeadApiAgent:
+    """
+    End-to-end HeyGen talking-head generator for Talexa.
+
+    Flow:
+    1. Read all slide_*.wav files from audio_dir
+    2. Normalize and merge into one WAV with 1s silence between slides
+    3. Convert merged WAV to MP3 for HeyGen upload
+    4. Prepare the uploaded image as a clean JPEG
+    5. Reuse cached avatar id for the same image when available
+    6. Otherwise:
+       - upload image as raw binary asset
+       - create photo avatar group from returned image_key
+       - poll until a usable avatar/talking-photo id exists
+       - cache that avatar id by image hash
+    7. Upload merged audio as raw binary asset
+    8. Generate video through /v2/video/generate using video_inputs
+    9. Poll video status and download final MP4
+    """
+
     def __init__(
         self,
-        source_image="Data/input/ref_face.png",
-        speech_dir="Data/intermediate/speech",
-        output_dir="Data/intermediate/talking_head/lecture1",
-        heygen_api_key=None,
-        talking_photo_id=None,
-        audio_asset_id=None,
-        audio_url=None,
-        avatar_group_name="talking_head_user",
-        poll_interval_s=5,
-        max_wait_s=1800,
+        source_image: str,
+        audio_dir: str,
+        output_dir: str = "Data/intermediate/talking_head_api",
+        api_key: Optional[str] = None,
+        ffmpeg_binary: str = "ffmpeg",
+        title: str = "Talking Head API Video",
+        poll_interval_seconds: int = 10,
+        timeout_seconds: int = 1800,
+        use_avatar_iv_model: bool = True,
+        max_image_side: int = 1536,
+        jpeg_quality: int = 95,
     ):
-        self.source_image = os.path.abspath(source_image) if source_image else None
-        self.speech_dir = os.path.abspath(speech_dir)
+        self.source_image = os.path.abspath(source_image)
+        self.audio_dir = os.path.abspath(audio_dir)
         self.output_dir = os.path.abspath(output_dir)
-        self.heygen_api_key = heygen_api_key or os.getenv("HEYGEN_API_KEY")
-        self.talking_photo_id = talking_photo_id or os.getenv("HEYGEN_TALKING_PHOTO_ID")
-        self.audio_asset_id = audio_asset_id or os.getenv("HEYGEN_AUDIO_ASSET_ID")
-        self.audio_url = audio_url or os.getenv("HEYGEN_AUDIO_URL")
-        self.avatar_group_name = avatar_group_name
-        self.poll_interval_s = poll_interval_s
-        self.max_wait_s = max_wait_s
+        self.api_key = api_key or os.getenv("HEYGEN_API_KEY")
+        self.ffmpeg_binary = ffmpeg_binary
+        self.title = title
+        self.poll_interval_seconds = poll_interval_seconds
+        self.timeout_seconds = timeout_seconds
+        self.use_avatar_iv_model = use_avatar_iv_model
+        self.max_image_side = max_image_side
+        self.jpeg_quality = jpeg_quality
 
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def get_audio_files(self):
-        return sorted(glob.glob(os.path.join(self.speech_dir, "slide_*.wav")))
+        self.merged_wav_path = os.path.join(self.output_dir, "merged_slides.wav")
+        self.upload_mp3_path = os.path.join(self.output_dir, "merged_slides_upload.mp3")
+        self.prepared_image_path = os.path.join(self.output_dir, "prepared_source.jpg")
+        self.output_video_path = os.path.join(self.output_dir, "talking_head.mp4")
+        self.cache_path = os.path.join(self.output_dir, "avatar_cache.json")
+        self.debug_dir = os.path.join(self.output_dir, "debug")
+        os.makedirs(self.debug_dir, exist_ok=True)
 
-    def _require_api_settings(self):
-        if not self.heygen_api_key:
-            raise ValueError("HEYGEN_API_KEY is not set.")
-        if not self.talking_photo_id and not os.path.exists(self.source_image):
+    # ---------------- basic helpers ----------------
+
+    def _require_api_key(self) -> None:
+        if not self.api_key:
             raise ValueError(
-                "Provide HEYGEN_TALKING_PHOTO_ID or a valid source_image to create one."
+                "HeyGen API key is required. Pass api_key=... or set HEYGEN_API_KEY."
             )
 
-    def _convert_audio_to_mp3(self, audio_path, slide_dir):
-        if audio_path.lower().endswith(".mp3"):
-            return audio_path
+    def _require_inputs(self) -> None:
+        if not os.path.exists(self.source_image):
+            raise FileNotFoundError(f"Source image not found: {self.source_image}")
+        if not os.path.isdir(self.audio_dir):
+            raise FileNotFoundError(f"Audio directory not found: {self.audio_dir}")
 
-        mp3_path = os.path.join(slide_dir, f"{Path(audio_path).stem}.mp3")
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            audio_path,
-            "-codec:a",
-            "libmp3lame",
-            "-q:a",
-            "2",
-            mp3_path,
-        ]
+    def _run_ffmpeg(self, args: List[str]) -> None:
+        cmd = [self.ffmpeg_binary, *args]
+        print("[FFmpeg]", " ".join(cmd))
         subprocess.run(cmd, check=True)
-        return mp3_path
 
-    def _merge_audio_files(self, audio_files, output_path):
+    def _natural_sort_key(self, path: str) -> List[Any]:
+        parts = re.split(r"(\d+)", Path(path).name.lower())
+        key: List[Any] = []
+        for part in parts:
+            key.append(int(part) if part.isdigit() else part)
+        return key
+
+    def _save_debug_json(self, filename: str, payload: Any) -> None:
+        path = os.path.join(self.debug_dir, filename)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _hash_file(self, file_path: str) -> str:
+        hasher = hashlib.sha256()
+        with open(file_path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def _load_cache(self) -> Dict[str, Any]:
+        if not os.path.exists(self.cache_path):
+            return {}
+        try:
+            with open(self.cache_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_cache(self, cache: Dict[str, Any]) -> None:
+        with open(self.cache_path, "w", encoding="utf-8") as handle:
+            json.dump(cache, handle, indent=2, ensure_ascii=False)
+
+    # ---------------- audio helpers ----------------
+
+    def get_audio_files(self) -> List[str]:
+        candidates = []
+        for entry in os.listdir(self.audio_dir):
+            if entry.lower().endswith(".wav"):
+                candidates.append(os.path.join(self.audio_dir, entry))
+
+        candidates.sort(key=self._natural_sort_key)
+
+        if not candidates:
+            raise FileNotFoundError(f"No .wav files found in: {self.audio_dir}")
+
+        return candidates
+
+    def merge_audio_with_silence(self, audio_files: Iterable[str]) -> str:
+        audio_files = list(audio_files)
         if not audio_files:
-            raise ValueError("No audio files to merge.")
+            raise ValueError("No audio files were provided for merging.")
 
-        list_path = os.path.join(os.path.dirname(output_path), "concat_list.txt")
-        with open(list_path, "w", encoding="utf-8") as f:
-            for path in audio_files:
-                f.write(f"file '{path.replace(\"'\", \"'\\\\''\")}'\n")
+        with tempfile.TemporaryDirectory(prefix="talking_head_api_") as temp_dir:
+            normalized_files = []
 
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            list_path,
-            "-c:a",
-            "pcm_s16le",
-            output_path,
-        ]
-        subprocess.run(cmd, check=True)
-        return output_path
+            for index, audio_path in enumerate(audio_files, start=1):
+                normalized_path = os.path.join(temp_dir, f"audio_{index:03d}.wav")
+                self._run_ffmpeg(
+                    [
+                        "-y",
+                        "-i",
+                        audio_path,
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "44100",
+                        "-c:a",
+                        "pcm_s16le",
+                        normalized_path,
+                    ]
+                )
+                normalized_files.append(normalized_path)
 
-    def _upload_audio_asset(self, client, audio_path):
-        with open(audio_path, "rb") as f:
-            response = client.post(
-                "https://upload.heygen.com/v1/asset",
-                headers={
-                    "X-Api-Key": self.heygen_api_key,
-                    "Content-Type": "audio/mpeg",
-                },
-                content=f.read(),
+            silence_path = os.path.join(temp_dir, "silence_1s.wav")
+            self._run_ffmpeg(
+                [
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=44100:cl=mono",
+                    "-t",
+                    "1",
+                    "-c:a",
+                    "pcm_s16le",
+                    silence_path,
+                ]
             )
-        response.raise_for_status()
-        payload = response.json()
 
-        data = payload.get("data", {}) if isinstance(payload, dict) else {}
-        asset_id = (
-            data.get("id")
-            or data.get("asset_id")
-            or data.get("assetId")
-            or payload.get("id")
+            concat_list_path = os.path.join(temp_dir, "concat_list.txt")
+            with open(concat_list_path, "w", encoding="utf-8") as handle:
+                for index, normalized_path in enumerate(normalized_files):
+                    normalized_for_ffmpeg = normalized_path.replace("\\", "/").replace("'", "'\\''")
+                    handle.write(f"file '{normalized_for_ffmpeg}'\n")
+                    if index < len(normalized_files) - 1:
+                        silence_for_ffmpeg = silence_path.replace("\\", "/").replace("'", "'\\''")
+                        handle.write(f"file '{silence_for_ffmpeg}'\n")
+
+            self._run_ffmpeg(
+                [
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    concat_list_path,
+                    "-c:a",
+                    "pcm_s16le",
+                    self.merged_wav_path,
+                ]
+            )
+
+        print(f"[TalkingHeadAPI] Merged WAV saved to: {self.merged_wav_path}")
+        return self.merged_wav_path
+
+    def convert_wav_to_mp3(self, wav_path: str) -> str:
+        self._run_ffmpeg(
+            [
+                "-y",
+                "-i",
+                wav_path,
+                "-codec:a",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                self.upload_mp3_path,
+            ]
         )
-        if not asset_id:
-            raise ValueError(f"Unexpected upload response: {payload}")
+        print(f"[TalkingHeadAPI] Upload MP3 saved to: {self.upload_mp3_path}")
+        return self.upload_mp3_path
 
-        return asset_id
+    # ---------------- image prep ----------------
 
-    def _upload_image_asset(self, client, image_path):
-        ext = os.path.splitext(image_path)[1].lower()
-        content_type = "image/png" if ext == ".png" else "image/jpeg"
-        with open(image_path, "rb") as f:
-            response = client.post(
-                "https://upload.heygen.com/v1/asset",
-                headers={
-                    "X-Api-Key": self.heygen_api_key,
-                    "Content-Type": content_type,
+    def prepare_image(self) -> Tuple[str, str]:
+        image = Image.open(self.source_image)
+        image = ImageOps.exif_transpose(image).convert("RGB")
+
+        width, height = image.size
+        max_side = max(width, height)
+        if max_side > self.max_image_side:
+            scale = self.max_image_side / float(max_side)
+            new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+            image = image.resize(new_size, Image.LANCZOS)
+
+        image.save(self.prepared_image_path, format="JPEG", quality=self.jpeg_quality, optimize=True)
+
+        image_hash = self._hash_file(self.prepared_image_path)
+        print(f"[TalkingHeadAPI] Prepared image saved to: {self.prepared_image_path}")
+        print(f"[TalkingHeadAPI] Prepared image hash: {image_hash}")
+        return self.prepared_image_path, image_hash
+
+    # ---------------- HTTP ----------------
+
+    def _http_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        body: Optional[bytes] = None,
+    ) -> Dict[str, Any]:
+        request = urllib.request.Request(url, data=body, method=method)
+        request.add_header("X-Api-Key", self.api_key or "")
+        for key, value in (headers or {}).items():
+            request.add_header(key, value)
+
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                content = response.read().decode("utf-8")
+                status_code = getattr(response, "status", 200)
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(details)
+            except Exception:
+                payload = {"raw_text": details}
+            self._save_debug_json(
+                f"http_error_{method.lower()}_{Path(urllib.parse.urlparse(url).path).name or 'root'}.json",
+                {
+                    "url": url,
+                    "status_code": exc.code,
+                    "headers": headers or {},
+                    "response": payload,
                 },
-                content=f.read(),
             )
-        response.raise_for_status()
-        payload = response.json()
+            raise RuntimeError(
+                f"HeyGen API request failed ({exc.code}) for {url}: {details}"
+            ) from exc
+
+        if not content:
+            return {}
+
+        try:
+            payload = json.loads(content)
+        except Exception:
+            payload = {"raw_text": content}
+
+        self._save_debug_json(
+            f"http_{method.lower()}_{Path(urllib.parse.urlparse(url).path).name or 'root'}.json",
+            {
+                "url": url,
+                "status_code": status_code,
+                "headers": headers or {},
+                "response": payload,
+            },
+        )
+        return payload
+
+    # ---------------- parsing helpers ----------------
+
+    def _extract_first_value(
+        self,
+        data: Any,
+        *,
+        preferred_keys: Iterable[str],
+    ) -> Optional[Any]:
+        preferred_keys = tuple(preferred_keys)
+
+        def walk(node: Any) -> Optional[Any]:
+            if isinstance(node, dict):
+                for key in preferred_keys:
+                    value = node.get(key)
+                    if value not in (None, "", [], {}):
+                        return value
+                for value in node.values():
+                    found = walk(value)
+                    if found not in (None, "", [], {}):
+                        return found
+            elif isinstance(node, list):
+                for item in node:
+                    found = walk(item)
+                    if found not in (None, "", [], {}):
+                        return found
+            return None
+
+        return walk(data)
+
+    def _extract_video_url(self, data: Any) -> Optional[str]:
+        candidate = self._extract_first_value(
+            data,
+            preferred_keys=("video_url", "url", "video_url_without_captions"),
+        )
+        return candidate if isinstance(candidate, str) and candidate.startswith("http") else None
+
+    # ---------------- asset upload ----------------
+
+    def upload_asset_raw(self, file_path: str, content_type: str) -> Dict[str, Any]:
+        with open(file_path, "rb") as handle:
+            body = handle.read()
+
+        print(f"[TalkingHeadAPI] Uploading asset: {file_path} ({content_type})")
+        return self._http_json(
+            "POST",
+            "https://upload.heygen.com/v1/asset",
+            headers={"Content-Type": content_type},
+            body=body,
+        )
+
+    def extract_image_key(self, payload: Dict[str, Any]) -> str:
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
         image_key = data.get("image_key") or data.get("key") or payload.get("image_key")
         if not image_key:
-            raise ValueError(f"Unexpected image upload response: {payload}")
-        return image_key
+            raise RuntimeError(f"Could not find image_key in upload response: {payload}")
+        return str(image_key)
 
-    def _create_photo_avatar_group(self, client, image_key):
-        payload = {"name": self.avatar_group_name, "image_key": image_key}
-        response = client.post(
-            "https://api.heygen.com/v2/photo_avatar/avatar_group/create",
-            headers={
-                "X-Api-Key": self.heygen_api_key,
-                "Content-Type": "application/json",
-            },
-            json=payload,
+    def extract_audio_asset_id(self, payload: Dict[str, Any]) -> str:
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        audio_asset_id = (
+            data.get("asset_id")
+            or data.get("audio_asset_id")
+            or data.get("id")
+            or payload.get("asset_id")
+            or payload.get("id")
         )
-        response.raise_for_status()
-        data = response.json()
+        if not audio_asset_id:
+            raise RuntimeError(f"Could not find audio asset id in upload response: {payload}")
+        return str(audio_asset_id)
+
+    # ---------------- photo avatar group flow ----------------
+
+    def create_photo_avatar_group(self, image_key: str) -> str:
+        payload = {"name": self.title, "image_key": image_key}
+        response = self._http_json(
+            "POST",
+            "https://api.heygen.com/v2/photo_avatar/avatar_group/create",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(payload).encode("utf-8"),
+        )
+
         group_id = (
-            data.get("data", {}).get("group_id")
-            or data.get("data", {}).get("id")
-            or data.get("group_id")
+            self._extract_first_value(response, preferred_keys=("group_id", "id"))
         )
         if not group_id:
-            raise ValueError(f"Unexpected avatar group response: {data}")
-        return group_id
+            raise RuntimeError(f"Could not find group id in response: {response}")
 
-    def _get_talking_photo_id_from_group(self, client, group_id):
-        response = client.get(
+        return str(group_id)
+
+    def list_avatars_in_group(self, group_id: str) -> List[Dict[str, Any]]:
+        response = self._http_json(
+            "GET",
             f"https://api.heygen.com/v2/avatar_group/{group_id}/avatars",
-            headers={"X-Api-Key": self.heygen_api_key},
         )
-        response.raise_for_status()
-        data = response.json()
-        avatars = data.get("data") or data.get("avatars") or []
-        if not avatars:
-            return None
-        first = avatars[0]
-        return first.get("id") or first.get("avatar_id")
 
-    def _resolve_talking_photo_id(self, client):
-        if self.talking_photo_id:
-            return self.talking_photo_id
-
-        image_key = self._upload_image_asset(client, self.source_image)
-        group_id = self._create_photo_avatar_group(client, image_key)
-
-        deadline = time.time() + self.max_wait_s
-        while time.time() < deadline:
-            talking_photo_id = self._get_talking_photo_id_from_group(client, group_id)
-            if talking_photo_id:
-                self.talking_photo_id = talking_photo_id
-                return talking_photo_id
-            time.sleep(self.poll_interval_s)
-
-        raise TimeoutError("Timed out waiting for talking_photo_id to become available.")
-
-    def _create_video(self, client, audio_asset_id, audio_url, title):
-        talking_photo_id = self._resolve_talking_photo_id(client)
-        voice = {"type": "audio"}
-        if audio_asset_id:
-            voice["audio_asset_id"] = audio_asset_id
-        elif audio_url:
-            voice["audio_url"] = audio_url
+        data = response.get("data")
+        if isinstance(data, dict):
+            avatars = data.get("avatar_list") or data.get("avatars") or data.get("items") or []
+        elif isinstance(data, list):
+            avatars = data
         else:
-            raise ValueError("Either audio_asset_id or audio_url must be provided.")
+            avatars = response.get("avatars") or []
 
+        return [avatar for avatar in avatars if isinstance(avatar, dict)]
+
+    def wait_for_avatar_id(self, group_id: str) -> str:
+        started = time.time()
+        ready_statuses = {"completed", "ready", "trained", "success", "succeeded"}
+
+        while True:
+            avatars = self.list_avatars_in_group(group_id)
+
+            if avatars:
+                avatar = avatars[0]
+                avatar_id = avatar.get("id") or avatar.get("avatar_id") or avatar.get("talking_photo_id")
+                status = str(avatar.get("status", "")).lower().strip()
+
+                print(f"[TalkingHeadAPI] Avatar status: {status or 'unknown'} | avatar_id: {avatar_id}")
+
+                if avatar_id and (status in ready_statuses or status not in {"pending", "processing", "uploaded"}):
+                    return str(avatar_id)
+
+            if time.time() - started > self.timeout_seconds:
+                raise TimeoutError(
+                    f"Timed out after {self.timeout_seconds} seconds waiting for avatar."
+                )
+
+            time.sleep(self.poll_interval_seconds)
+
+    def resolve_avatar_id(self) -> str:
+        prepared_image_path, image_hash = self.prepare_image()
+
+        cache = self._load_cache()
+        cached = cache.get(image_hash)
+        if isinstance(cached, dict) and cached.get("avatar_id"):
+            print(f"[TalkingHeadAPI] Reusing cached avatar_id: {cached['avatar_id']}")
+            return str(cached["avatar_id"])
+
+        image_upload = self.upload_asset_raw(prepared_image_path, "image/jpeg")
+        image_key = self.extract_image_key(image_upload)
+
+        group_id = self.create_photo_avatar_group(image_key)
+        avatar_id = self.wait_for_avatar_id(group_id)
+
+        cache[image_hash] = {
+            "avatar_id": avatar_id,
+            "group_id": group_id,
+            "source_image": self.source_image,
+            "prepared_image_path": prepared_image_path,
+            "created_at": int(time.time()),
+        }
+        self._save_cache(cache)
+
+        return avatar_id
+
+    # ---------------- video generation ----------------
+
+    def create_video(self, avatar_id: str, audio_asset_id: str) -> str:
         payload = {
-            "title": title,
+            "title": self.title,
             "video_inputs": [
                 {
                     "character": {
                         "type": "talking_photo",
-                        "talking_photo_id": talking_photo_id,
+                        "talking_photo_id": avatar_id,
                     },
-                    "voice": voice,
+                    "voice": {
+                        "type": "audio",
+                        "audio_asset_id": audio_asset_id,
+                    },
                 }
             ],
         }
-        response = client.post(
+
+        if self.use_avatar_iv_model:
+            payload["use_avatar_iv_model"] = True
+
+        print(f"[TalkingHeadAPI] Creating video with avatar_id={avatar_id} audio_asset_id={audio_asset_id}")
+        response = self._http_json(
+            "POST",
             "https://api.heygen.com/v2/video/generate",
-            headers={
-                "X-Api-Key": self.heygen_api_key,
-                "Content-Type": "application/json",
-            },
-            json=payload,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(payload).encode("utf-8"),
         )
-        response.raise_for_status()
-        data = response.json()
-        video_id = (
-            data.get("data", {}).get("video_id")
-            or data.get("data", {}).get("id")
-            or data.get("video_id")
+
+        video_id = self._extract_first_value(
+            response,
+            preferred_keys=("video_id", "id"),
         )
         if not video_id:
-            raise ValueError(f"Unexpected create response: {data}")
-        return video_id
+            raise RuntimeError(f"Could not find video id in response: {response}")
 
-    def _poll_video(self, client, video_id):
-        deadline = time.time() + self.max_wait_s
-        while time.time() < deadline:
-            response = client.get(
-                "https://api.heygen.com/v1/video_status.get",
-                params={"video_id": video_id},
-                headers={"X-Api-Key": self.heygen_api_key},
-            )
-            response.raise_for_status()
-            data = response.json().get("data", {})
-            status = data.get("status")
+        return str(video_id)
+
+    def get_video_status(self, video_id: str) -> Dict[str, Any]:
+        query = urllib.parse.urlencode({"video_id": video_id})
+        url = f"https://api.heygen.com/v1/video_status.get?{query}"
+        return self._http_json("GET", url)
+
+    def wait_for_video(self, video_id: str) -> str:
+        started = time.time()
+
+        while True:
+            response = self.get_video_status(video_id)
+            status = str(
+                self._extract_first_value(
+                    response,
+                    preferred_keys=("status", "video_status"),
+                )
+                or ""
+            ).lower()
+
+            print(f"[TalkingHeadAPI] Video status: {status or 'unknown'}")
 
             if status == "completed":
-                return data
+                video_url = self._extract_video_url(response)
+                if not video_url:
+                    raise RuntimeError(
+                        f"Video completed but no downloadable URL was found: {response}"
+                    )
+                return video_url
+
             if status == "failed":
-                error = data.get("error") or "Unknown error"
-                raise RuntimeError(f"HeyGen video failed: {error}")
+                raise RuntimeError(f"HeyGen video generation failed: {response}")
 
-            time.sleep(self.poll_interval_s)
+            if time.time() - started > self.timeout_seconds:
+                raise TimeoutError(
+                    f"Timed out after {self.timeout_seconds} seconds waiting for video."
+                )
 
-        raise TimeoutError(f"Timed out waiting for video {video_id}")
+            time.sleep(self.poll_interval_seconds)
 
-    def run_one(self, audio_path, output_name="lecture1"):
-        slide_name = Path(audio_path).stem
-        slide_dir = self.output_dir
-        os.makedirs(slide_dir, exist_ok=True)
-        self._require_api_settings()
+    def download_file(self, url: str, output_path: str) -> str:
+        print(f"[TalkingHeadAPI] Downloading video from: {url}")
+        request = urllib.request.Request(url, method="GET")
 
-        with httpx.Client(timeout=300) as client:
-            audio_asset_id = self.audio_asset_id
-            audio_url = self.audio_url
-            if not audio_asset_id and not audio_url:
-                mp3_path = self._convert_audio_to_mp3(audio_path, slide_dir)
-                audio_asset_id = self._upload_audio_asset(client, mp3_path)
-            video_id = self._create_video(
-                client,
-                audio_asset_id=audio_asset_id,
-                audio_url=audio_url,
-                title=slide_name,
-            )
-            status_data = self._poll_video(client, video_id)
-            video_url = status_data.get("video_url")
-            if not video_url:
-                raise ValueError(f"Missing video_url for {video_id}")
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                with open(output_path, "wb") as handle:
+                    handle.write(response.read())
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Could not download generated video ({exc.code}): {details}"
+            ) from exc
 
-            final_video = os.path.join(self.output_dir, f"{output_name}.mp4")
-            with client.stream("GET", video_url) as response:
-                response.raise_for_status()
-                with open(final_video, "wb") as f:
-                    for chunk in response.iter_bytes():
-                        f.write(chunk)
+        print(f"[TalkingHeadAPI] Final MP4 saved to: {output_path}")
+        return output_path
 
-        print(f"[TalkingHead] Saved: {final_video}")
+    # ---------------- main ----------------
 
-    def run(self, limit_slides=None):
-        if not self.source_image and not self.talking_photo_id:
-            raise ValueError("Source image or HEYGEN_TALKING_PHOTO_ID is required.")
-        if self.source_image and not os.path.exists(self.source_image):
-            raise FileNotFoundError(f"Source image not found: {self.source_image}")
-
-        if not os.path.isdir(self.speech_dir):
-            raise FileNotFoundError(f"Speech directory not found: {self.speech_dir}")
+    def run(self) -> Dict[str, str]:
+        self._require_api_key()
+        self._require_inputs()
 
         audio_files = self.get_audio_files()
+        print(f"[TalkingHeadAPI] Found {len(audio_files)} wav file(s).")
 
-        if not audio_files:
-            raise FileNotFoundError(f"No slide wav files found in: {self.speech_dir}")
+        merged_wav_path = self.merge_audio_with_silence(audio_files)
+        upload_mp3_path = self.convert_wav_to_mp3(merged_wav_path)
 
-        if limit_slides is not None:
-            audio_files = audio_files[:limit_slides]
+        avatar_id = self.resolve_avatar_id()
 
-        print(f"[TalkingHead] Slides to merge: {len(audio_files)}")
+        audio_upload = self.upload_asset_raw(upload_mp3_path, "audio/mpeg")
+        audio_asset_id = self.extract_audio_asset_id(audio_upload)
 
-        os.makedirs(self.output_dir, exist_ok=True)
-        merged_wav = os.path.join(self.output_dir, "merged.wav")
-        self._merge_audio_files(audio_files, merged_wav)
+        video_id = self.create_video(avatar_id, audio_asset_id)
+        video_url = self.wait_for_video(video_id)
+        final_video_path = self.download_file(video_url, self.output_video_path)
 
-        output_name = os.path.basename(self.output_dir.rstrip(os.sep)) or "lecture1"
-        print(f"[TalkingHead] Generating video for: {output_name}")
-        self.run_one(merged_wav, output_name=output_name)
+        result = {
+            "merged_wav_path": merged_wav_path,
+            "upload_mp3_path": upload_mp3_path,
+            "final_video_path": final_video_path,
+            "video_id": video_id,
+            "video_url": video_url,
+            "avatar_id": avatar_id,
+            "audio_asset_id": audio_asset_id,
+        }
 
-        print("[TalkingHead] All done.")
+        print("[TalkingHeadAPI] Done.")
+        print(json.dumps(result, indent=2))
+        return result
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Merge slide audio, create/reuse a photo avatar, and generate a HeyGen talking head MP4."
+    )
+    parser.add_argument("--image", required=True, help="Path to the portrait image.")
+    parser.add_argument(
+        "--audio-dir",
+        required=True,
+        help="Folder containing slide audio WAV files such as slide_1.wav, slide_2.wav.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="Data/intermediate/talking_head_api",
+        help="Where merged audio and final video should be saved.",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="HeyGen API key. If omitted, HEYGEN_API_KEY is used.",
+    )
+    parser.add_argument(
+        "--title",
+        default="Talking Head API Video",
+        help="Display title for the generated HeyGen video.",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=int,
+        default=10,
+        help="Seconds between status checks.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=1800,
+        help="Maximum number of seconds to wait for rendering.",
+    )
+    parser.add_argument(
+        "--ffmpeg-binary",
+        default="ffmpeg",
+        help="Path or command name for ffmpeg.",
+    )
+    return parser
 
 
 if __name__ == "__main__":
-    agent = TalkingHeadAgent(
-        source_image="Data/input/ref_face.png",
-        speech_dir="Data/intermediate/speech",
-        output_dir="Data/intermediate/talking_head/lecture1",
-        heygen_api_key=os.getenv("sk_V2_hgu_kGc48dy2AJZ_vWopK7Gxdq0CurG3uryonH2mprn7NC1R"),
-        talking_photo_id=os.getenv("HEYGEN_TALKING_PHOTO_ID"),
+    args = build_arg_parser().parse_args()
+
+    agent = TalkingHeadApiAgent(
+        source_image=args.image,
+        audio_dir=args.audio_dir,
+        output_dir=args.output_dir,
+        api_key=args.api_key,
+        ffmpeg_binary=args.ffmpeg_binary,
+        title=args.title,
+        poll_interval_seconds=args.poll_interval,
+        timeout_seconds=args.timeout,
     )
-    agent.run()
+    agent.run() 
